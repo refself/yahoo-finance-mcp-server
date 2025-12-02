@@ -1,132 +1,43 @@
-import { routeAgentRequest, type Schedule } from "agents";
+import { YahooFinanceMCP } from "./mcp";
 
-import { getSchedulePrompt } from "agents/schedule";
+export { YahooFinanceMCP };
 
-import { AIChatAgent } from "agents/ai-chat-agent";
-import {
-  generateId,
-  streamText,
-  type StreamTextOnFinishCallback,
-  stepCountIs,
-  createUIMessageStream,
-  convertToModelMessages,
-  createUIMessageStreamResponse,
-  type ToolSet
-} from "ai";
-import { openai } from "@ai-sdk/openai";
-import { processToolCalls, cleanupMessages } from "./utils";
-import { tools, executions } from "./tools";
-// import { env } from "cloudflare:workers";
-
-const model = openai("gpt-4o-2024-11-20");
-// Cloudflare AI Gateway
-// const openai = createOpenAI({
-//   apiKey: env.OPENAI_API_KEY,
-//   baseURL: env.GATEWAY_BASE_URL,
-// });
-
-/**
- * Chat Agent implementation that handles real-time AI chat interactions
- */
-export class Chat extends AIChatAgent<Env> {
-  /**
-   * Handles incoming chat messages and manages the response stream
-   */
-  async onChatMessage(
-    onFinish: StreamTextOnFinishCallback<ToolSet>,
-    _options?: { abortSignal?: AbortSignal }
-  ) {
-    // const mcpConnection = await this.mcp.connect(
-    //   "https://path-to-mcp-server/sse"
-    // );
-
-    // Collect all tools, including MCP tools
-    const allTools = {
-      ...tools,
-      ...this.mcp.getAITools()
-    };
-
-    const stream = createUIMessageStream({
-      execute: async ({ writer }) => {
-        // Clean up incomplete tool calls to prevent API errors
-        const cleanedMessages = cleanupMessages(this.messages);
-
-        // Process any pending tool calls from previous messages
-        // This handles human-in-the-loop confirmations for tools
-        const processedMessages = await processToolCalls({
-          messages: cleanedMessages,
-          dataStream: writer,
-          tools: allTools,
-          executions
-        });
-
-        const result = streamText({
-          system: `You are a helpful assistant that can do various tasks... 
-
-${getSchedulePrompt({ date: new Date() })}
-
-If the user asks to schedule a task, use the schedule tool to schedule the task.
-`,
-
-          messages: convertToModelMessages(processedMessages),
-          model,
-          tools: allTools,
-          // Type boundary: streamText expects specific tool types, but base class uses ToolSet
-          // This is safe because our tools satisfy ToolSet interface (verified by 'satisfies' in tools.ts)
-          onFinish: onFinish as unknown as StreamTextOnFinishCallback<
-            typeof allTools
-          >,
-          stopWhen: stepCountIs(10)
-        });
-
-        writer.merge(result.toUIMessageStream());
-      }
-    });
-
-    return createUIMessageStreamResponse({ stream });
-  }
-  async executeTask(description: string, _task: Schedule<string>) {
-    await this.saveMessages([
-      ...this.messages,
-      {
-        id: generateId(),
-        role: "user",
-        parts: [
-          {
-            type: "text",
-            text: `Running scheduled task: ${description}`
-          }
-        ],
-        metadata: {
-          createdAt: new Date()
-        }
-      }
-    ]);
-  }
-}
-
-/**
- * Worker entry point that routes incoming requests to the appropriate handler
- */
 export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext) {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/check-open-ai-key") {
-      const hasOpenAIKey = !!process.env.OPENAI_API_KEY;
+    if (url.pathname === "/" || url.pathname === "/health") {
       return Response.json({
-        success: hasOpenAIKey
+        name: "Yahoo Finance MCP Server",
+        version: "1.0.0",
+        description: "MCP server providing Yahoo Finance data tools",
+        endpoints: { sse: "/sse", mcp: "/mcp" },
+        tools: [
+          { name: "get_historical_stock_prices", description: "Get historical OHLCV data", params: { ticker: "string", period: "1d|5d|1mo|3mo|6mo|1y|2y|5y|10y|ytd|max", interval: "1m|2m|5m|15m|30m|60m|90m|1h|1d|5d|1wk|1mo|3mo" } },
+          { name: "get_stock_info", description: "Get comprehensive stock information", params: { ticker: "string" } },
+          { name: "get_yahoo_finance_news", description: "Get latest news", params: { ticker: "string" } },
+          { name: "get_stock_actions", description: "Get dividends and splits", params: { ticker: "string" } },
+          { name: "get_financial_statement", description: "Get financial statements", params: { ticker: "string", financial_type: "income_stmt|quarterly_income_stmt|balance_sheet|quarterly_balance_sheet|cashflow|quarterly_cashflow" } },
+          { name: "get_holder_info", description: "Get holder information", params: { ticker: "string", holder_type: "major_holders|institutional_holders|mutualfund_holders|insider_transactions|insider_purchases|insider_roster_holders" } },
+          { name: "get_option_expiration_dates", description: "Get option expiration dates", params: { ticker: "string" } },
+          { name: "get_option_chain", description: "Get option chain data", params: { ticker: "string", expiration_date: "YYYY-MM-DD", option_type: "calls|puts" } },
+          { name: "get_recommendations", description: "Get analyst recommendations", params: { ticker: "string", recommendation_type: "recommendations|upgrades_downgrades", months_back: "number" } }
+        ],
+        usage: {
+          claude_desktop: { mcpServers: { "yahoo-finance": { command: "npx", args: ["mcp-remote", "https://your-worker.workers.dev/sse"] } } },
+          mcp_inspector: "npx @modelcontextprotocol/inspector@latest"
+        }
       });
     }
-    if (!process.env.OPENAI_API_KEY) {
-      console.error(
-        "OPENAI_API_KEY is not set, don't forget to set it locally in .dev.vars, and use `wrangler secret bulk .dev.vars` to upload it to production"
-      );
+
+    if (url.pathname.startsWith("/sse")) {
+      return YahooFinanceMCP.serveSSE("/sse", { binding: "YahooFinanceMCP" }).fetch(request, env, ctx);
     }
-    return (
-      // Route the request to our agent or return 404 if not found
-      (await routeAgentRequest(request, env)) ||
-      new Response("Not found", { status: 404 })
-    );
+
+    if (url.pathname.startsWith("/mcp")) {
+      return YahooFinanceMCP.serve("/mcp", { binding: "YahooFinanceMCP" }).fetch(request, env, ctx);
+    }
+
+    return new Response("Not found", { status: 404 });
   }
 } satisfies ExportedHandler<Env>;
