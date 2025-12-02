@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/image.png" alt="Yahoo Finance MCP Server" width="400">
+</p>
+
 # Yahoo Finance MCP Server
 
 A remote MCP (Model Context Protocol) server for Yahoo Finance data, deployed on Cloudflare Workers.
