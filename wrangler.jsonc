@@ -1,7 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "yahoo-finance-mcp",
-  "account_id": "360b2a10fcae59d8bed4ee9ec7954cb4",
   "main": "src/server.ts",
   "compatibility_date": "2025-08-03",
   "compatibility_flags": ["nodejs_compat"],
