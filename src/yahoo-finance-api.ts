@@ -5,8 +5,8 @@ export type FinancialType = "income_stmt" | "quarterly_income_stmt" | "balance_s
 export type HolderType = "major_holders" | "institutional_holders" | "mutualfund_holders" | "insider_transactions" | "insider_purchases" | "insider_roster_holders";
 export type RecommendationType = "recommendations" | "upgrades_downgrades";
 
-let cachedCookie: string | null = null;
 let cachedCrumb: string | null = null;
+let cachedCookie: string | null = null;
 let cacheExpiry = 0;
 
 const HEADERS = {
@@ -15,55 +15,85 @@ const HEADERS = {
   "Accept-Language": "en-US,en;q=0.5"
 };
 
-async function getCookieAndCrumb(): Promise<{ cookie: string; crumb: string }> {
+async function getCrumb(): Promise<{ crumb: string; cookie: string } | null> {
   const now = Date.now();
-  if (cachedCookie && cachedCrumb && now < cacheExpiry) {
-    return { cookie: cachedCookie, crumb: cachedCrumb };
+  if (cachedCrumb && cachedCookie && now < cacheExpiry) {
+    return { crumb: cachedCrumb, cookie: cachedCookie };
   }
 
-  // Step 1: Get cookie from Yahoo Finance homepage
-  const homeResponse = await fetch("https://finance.yahoo.com", {
-    headers: HEADERS,
-    redirect: "follow"
-  });
+  try {
+    // Step 1: Get cookie from fc.yahoo.com
+    const fcResponse = await fetch("https://fc.yahoo.com", {
+      headers: HEADERS,
+      redirect: "manual"
+    });
 
-  const setCookieHeader = homeResponse.headers.get("set-cookie") || "";
-  const cookies = setCookieHeader.split(",").map(c => c.split(";")[0].trim()).join("; ");
+    let cookies = "";
+    const setCookie = fcResponse.headers.get("set-cookie");
+    if (setCookie) {
+      cookies = setCookie.split(",").map(c => c.split(";")[0].trim()).filter(Boolean).join("; ");
+    }
 
-  if (!cookies) {
-    throw new Error("Failed to get Yahoo cookie");
+    // Fallback: try finance.yahoo.com
+    if (!cookies) {
+      const financeResponse = await fetch("https://finance.yahoo.com", {
+        headers: HEADERS,
+        redirect: "follow"
+      });
+      const setCookie2 = financeResponse.headers.get("set-cookie");
+      if (setCookie2) {
+        cookies = setCookie2.split(",").map(c => c.split(";")[0].trim()).filter(Boolean).join("; ");
+      }
+    }
+
+    if (!cookies) {
+      console.log("No cookies obtained");
+      return null;
+    }
+
+    // Step 2: Get crumb
+    const crumbResponse = await fetch(`${BASE_URL}/v1/test/getcrumb`, {
+      headers: { ...HEADERS, "Cookie": cookies }
+    });
+
+    if (!crumbResponse.ok) {
+      console.log("Crumb request failed:", crumbResponse.status);
+      return null;
+    }
+
+    const crumb = await crumbResponse.text();
+    if (!crumb || crumb.includes("<") || crumb.includes("error")) {
+      console.log("Invalid crumb:", crumb.slice(0, 50));
+      return null;
+    }
+
+    cachedCrumb = crumb;
+    cachedCookie = cookies;
+    cacheExpiry = now + 30 * 60 * 1000;
+
+    return { crumb, cookie: cookies };
+  } catch (error) {
+    console.log("getCrumb error:", error);
+    return null;
   }
-
-  // Step 2: Get crumb using the cookie
-  const crumbResponse = await fetch(`${BASE_URL_V2}/v1/test/getcrumb`, {
-    headers: { ...HEADERS, "Cookie": cookies }
-  });
-
-  const crumb = await crumbResponse.text();
-  if (!crumb || crumb.includes("error")) {
-    throw new Error("Failed to get Yahoo crumb");
-  }
-
-  cachedCookie = cookies;
-  cachedCrumb = crumb;
-  cacheExpiry = now + 30 * 60 * 1000; // Cache for 30 minutes
-
-  return { cookie: cookies, crumb };
 }
 
-async function fetchYahoo(url: string, useCrumb = false): Promise<Response> {
+async function fetchYahoo(url: string, needsCrumb = false): Promise<Response> {
   let finalUrl = url;
-  let headers: Record<string, string> = { ...HEADERS };
+  const headers: Record<string, string> = { ...HEADERS };
 
-  if (useCrumb) {
-    const { cookie, crumb } = await getCookieAndCrumb();
-    headers["Cookie"] = cookie;
-    finalUrl += (url.includes("?") ? "&" : "?") + `crumb=${encodeURIComponent(crumb)}`;
+  if (needsCrumb) {
+    const auth = await getCrumb();
+    if (auth) {
+      headers["Cookie"] = auth.cookie;
+      finalUrl += (url.includes("?") ? "&" : "?") + `crumb=${encodeURIComponent(auth.crumb)}`;
+    }
   }
 
   const response = await fetch(finalUrl, { headers });
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    const text = await response.text();
+    throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
   }
   return response;
 }
@@ -71,7 +101,7 @@ async function fetchYahoo(url: string, useCrumb = false): Promise<Response> {
 export async function getHistoricalStockPrices(ticker: string, period = "1mo", interval = "1d"): Promise<string> {
   try {
     const url = `${BASE_URL}/v8/finance/chart/${encodeURIComponent(ticker)}?range=${period}&interval=${interval}&includeAdjustedClose=true`;
-    const response = await fetchYahoo(url, true);
+    const response = await fetchYahoo(url, false);
     const data = await response.json() as any;
 
     if (data.chart?.error) return `Error: ${data.chart.error.description}`;
@@ -82,7 +112,7 @@ export async function getHistoricalStockPrices(ticker: string, period = "1mo", i
     const quotes = result.indicators?.quote?.[0] || {};
     const adjClose = result.indicators?.adjclose?.[0]?.adjclose;
 
-    const records = timestamps.map((ts: number, i: number) => ({
+    return JSON.stringify(timestamps.map((ts: number, i: number) => ({
       Date: new Date(ts * 1000).toISOString(),
       Open: quotes.open?.[i] ?? null,
       High: quotes.high?.[i] ?? null,
@@ -90,9 +120,7 @@ export async function getHistoricalStockPrices(ticker: string, period = "1mo", i
       Close: quotes.close?.[i] ?? null,
       Volume: quotes.volume?.[i] ?? null,
       "Adj Close": adjClose?.[i] ?? quotes.close?.[i] ?? null
-    }));
-
-    return JSON.stringify(records);
+    })));
   } catch (error) {
     return `Error: ${error}`;
   }
@@ -113,7 +141,6 @@ export async function getStockInfo(ticker: string): Promise<string> {
     for (const [, value] of Object.entries(result)) {
       if (value && typeof value === "object") Object.assign(info, value);
     }
-
     return JSON.stringify(info);
   } catch (error) {
     return `Error: ${error}`;
@@ -123,7 +150,7 @@ export async function getStockInfo(ticker: string): Promise<string> {
 export async function getYahooFinanceNews(ticker: string): Promise<string> {
   try {
     const url = `${BASE_URL}/v1/finance/search?q=${encodeURIComponent(ticker)}&newsCount=10&enableFuzzyQuery=false`;
-    const response = await fetchYahoo(url, false); // Search doesn't need crumb
+    const response = await fetchYahoo(url, false);
     const data = await response.json() as any;
 
     const news = data.news || [];
@@ -140,7 +167,7 @@ export async function getYahooFinanceNews(ticker: string): Promise<string> {
 export async function getStockActions(ticker: string): Promise<string> {
   try {
     const url = `${BASE_URL}/v8/finance/chart/${encodeURIComponent(ticker)}?range=max&interval=1d&events=div,split`;
-    const response = await fetchYahoo(url, true);
+    const response = await fetchYahoo(url, false);
     const data = await response.json() as any;
 
     if (data.chart?.error) return `Error: ${data.chart.error.description}`;
@@ -148,14 +175,12 @@ export async function getStockActions(ticker: string): Promise<string> {
     if (!result) return `Ticker ${ticker} not found.`;
 
     const events = result.events || {};
-    const dividends = events.dividends || {};
-    const splits = events.splits || {};
-
     const actions: any[] = [];
-    for (const div of Object.values(dividends) as any[]) {
+
+    for (const div of Object.values(events.dividends || {}) as any[]) {
       actions.push({ Date: new Date(div.date * 1000).toISOString(), Dividends: div.amount, "Stock Splits": 0 });
     }
-    for (const split of Object.values(splits) as any[]) {
+    for (const split of Object.values(events.splits || {}) as any[]) {
       actions.push({ Date: new Date(split.date * 1000).toISOString(), Dividends: 0, "Stock Splits": split.numerator / split.denominator });
     }
 
@@ -200,7 +225,7 @@ export async function getFinancialStatement(ticker: string, financialType: Finan
       statements = result[key]?.cashflowStatements || [];
     }
 
-    const formatted = statements.map((stmt: any) => {
+    return JSON.stringify(statements.map((stmt: any) => {
       const obj: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(stmt)) {
         if (value && typeof value === "object" && "raw" in (value as any)) {
@@ -212,9 +237,7 @@ export async function getFinancialStatement(ticker: string, financialType: Finan
         }
       }
       return obj;
-    });
-
-    return JSON.stringify(formatted);
+    }));
   } catch (error) {
     return `Error: ${error}`;
   }
@@ -281,11 +304,9 @@ export async function getOptionExpirationDates(ticker: string): Promise<string> 
     const result = data.optionChain?.result?.[0];
     if (!result) return `Ticker ${ticker} not found.`;
 
-    const expirationDates = (result.expirationDates || []).map((ts: number) =>
+    return JSON.stringify((result.expirationDates || []).map((ts: number) =>
       new Date(ts * 1000).toISOString().split("T")[0]
-    );
-
-    return JSON.stringify(expirationDates);
+    ));
   } catch (error) {
     return `Error: ${error}`;
   }
@@ -327,9 +348,7 @@ export async function getRecommendations(ticker: string, recommendationType: Rec
     }
 
     const history = result.upgradeDowngradeHistory?.history || [];
-    const cutoffDate = new Date();
-    cutoffDate.setMonth(cutoffDate.getMonth() - monthsBack);
-    const cutoffTs = Math.floor(cutoffDate.getTime() / 1000);
+    const cutoffTs = Math.floor((Date.now() - monthsBack * 30 * 24 * 60 * 60 * 1000) / 1000);
 
     const filtered = history
       .filter((item: any) => item.epochGradeDate && item.epochGradeDate >= cutoffTs)
